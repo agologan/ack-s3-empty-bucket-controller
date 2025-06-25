@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -22,10 +21,10 @@ import (
 )
 
 const (
-	ackGroup    = "s3.services.k8s.aws"
-	ackVersion  = "v1alpha1"
-	ackResource = "buckets"
-	finalizer   = "finalizers.s3.services.k8s.aws/EmptyBucket"
+	apiGroup         = "s3.services.k8s.aws"
+	apiVersion       = "v1alpha1"
+	apiResource      = "buckets"
+	targetAnnotation = "s3.services.k8s.aws/empty-on-delete"
 )
 
 func getKubeConfig() (*rest.Config, error) {
@@ -70,26 +69,31 @@ func emptyBucket(ctx context.Context, s3client *s3.Client, bucket string) error 
 	return nil
 }
 
-func removeFinalizer(dynamicClient dynamic.Interface, obj *unstructured.Unstructured, gvr schema.GroupVersionResource) error {
-	finalizers, found, _ := unstructured.NestedStringSlice(obj.Object, "metadata", "finalizers")
-	if !found {
-		return nil
-	}
-	var newFinalizers []string
-	for _, f := range finalizers {
-		if f != finalizer {
-			newFinalizers = append(newFinalizers, f)
+type BucketUpdater struct {
+	s3client *s3.Client
+}
+
+func (bu *BucketUpdater) onBucketUpdate(_, newObj interface{}) {
+	obj := newObj.(*unstructured.Unstructured)
+	meta := obj.Object["metadata"].(map[string]interface{})
+	annotations, _ := meta["annotations"].(map[string]interface{})
+	deletionTimestamp, _ := meta["deletionTimestamp"].(string)
+	if deletionTimestamp != "" && annotations != nil {
+		if val, ok := annotations[targetAnnotation]; ok && val == "true" {
+			bucketName := obj.Object["spec"].(map[string]interface{})["name"].(string)
+			if bucketName == "" {
+				bucketName = obj.GetName()
+			}
+			if err := emptyBucket(context.TODO(), bu.s3client, bucketName); err != nil {
+				log.Printf("Error emptying bucket %s: %v", bucketName, err)
+				return
+			}
 		}
 	}
-	if err := unstructured.SetNestedStringSlice(obj.Object, newFinalizers, "metadata", "finalizers"); err != nil {
-		return err
-	}
-	_, err := dynamicClient.Resource(gvr).Namespace(obj.GetNamespace()).Update(context.TODO(), obj, metav1.UpdateOptions{})
-	return err
 }
 
 func main() {
-	log.Println("Starting S3 ACK bucket finalizer service...")
+	log.Println("Starting S3 ACK empty bucket controller...")
 	cfg, err := getKubeConfig()
 	if err != nil {
 		log.Fatalf("Failed to get kubeconfig: %v", err)
@@ -98,7 +102,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create dynamic client: %v", err)
 	}
-	gvr := schema.GroupVersionResource{Group: ackGroup, Version: ackVersion, Resource: ackResource}
+	gvr := schema.GroupVersionResource{Group: apiGroup, Version: apiVersion, Resource: apiResource}
 
 	awsCfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
@@ -106,39 +110,14 @@ func main() {
 	}
 	s3client := s3.NewFromConfig(awsCfg)
 
+	updater := &BucketUpdater{s3client: s3client}
+
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 30*time.Second)
 	informer := factory.ForResource(gvr).Informer()
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			obj := newObj.(*unstructured.Unstructured)
-			meta := obj.Object["metadata"].(map[string]interface{})
-			finalizers, _ := meta["finalizers"].([]interface{})
-			deletionTimestamp, _ := meta["deletionTimestamp"].(string)
-			if deletionTimestamp != "" && containsString(finalizers, finalizer) {
-				bucketName := obj.Object["spec"].(map[string]interface{})["name"].(string)
-				if bucketName == "" {
-					bucketName = obj.GetName()
-				}
-				if err := emptyBucket(context.TODO(), s3client, bucketName); err != nil {
-					log.Printf("Error emptying bucket %s: %v", bucketName, err)
-					return
-				}
-				if err := removeFinalizer(dynClient, obj, gvr); err != nil {
-					log.Printf("Error removing finalizer: %v", err)
-				}
-			}
-		},
+		UpdateFunc: updater.onBucketUpdate,
 	})
 	stop := make(chan struct{})
 	informer.Run(stop)
-}
-
-func containsString(slice []interface{}, s string) bool {
-	for _, v := range slice {
-		if str, ok := v.(string); ok && str == s {
-			return true
-		}
-	}
-	return false
 }

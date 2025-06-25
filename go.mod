@@ -1,4 +1,4 @@
-module ack-s3-empty-bucket-finalizer
+module ack-s3-empty-bucket-controller
 
 go 1.24.0
 
