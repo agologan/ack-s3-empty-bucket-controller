@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ack-s3-empty-bucket-controller
+description: K8s controller that empties S3 buckets on deletion of the corresponding K8s resource.
+type: application
+version: 0.1.0
+appVersion: "latest"
