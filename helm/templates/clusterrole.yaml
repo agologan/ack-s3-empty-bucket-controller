@@ -3,8 +3,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: {{ include "empty-bucket-controller.fullname" . }}
-labels:
-    {{- include "empty-bucket-controller.labels" . | nindent 4 }}
+  labels:
+      {{- include "empty-bucket-controller.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["s3.services.k8s.aws"]
     resources: ["buckets"]
